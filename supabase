@@ -1,0 +1,209 @@
+create extension if not exists pgcrypto;
+
+create table if not exists public.prompts (
+  id uuid primary key default gen_random_uuid(),
+  title text not null check (char_length(title) between 1 and 100),
+  body text not null check (char_length(body) between 1 and 5000),
+  image_url text not null,
+  image_path text not null,
+  copy_count bigint not null default 0 check (copy_count >= 0),
+  average_rating numeric(3,2) not null default 0,
+  rating_count integer not null default 0,
+  is_popular boolean not null default false,
+  created_by uuid not null references auth.users(id) on delete cascade,
+  created_at timestamptz not null default now()
+);
+
+create unique index if not exists one_popular_prompt
+on public.prompts(is_popular)
+where is_popular = true;
+
+create table if not exists public.ratings (
+  id uuid primary key default gen_random_uuid(),
+  prompt_id uuid not null references public.prompts(id) on delete cascade,
+  user_id uuid not null references auth.users(id) on delete cascade,
+  value integer not null check (value between 1 and 5),
+  unique(prompt_id, user_id)
+);
+
+alter table public.prompts enable row level security;
+alter table public.ratings enable row level security;
+
+create or replace function public.is_promptix_admin()
+returns boolean
+language sql
+stable
+security definer
+set search_path = ''
+as $$
+  select coalesce(
+    (auth.jwt() -> 'app_metadata' ->> 'role') = 'admin',
+    false
+  );
+$$;
+
+revoke all on function public.is_promptix_admin() from public;
+grant execute on function public.is_promptix_admin()
+to anon, authenticated;
+
+create policy "Anyone reads prompts"
+on public.prompts
+for select
+to anon, authenticated
+using (true);
+
+create policy "Admins insert prompts"
+on public.prompts
+for insert
+to authenticated
+with check (
+  public.is_promptix_admin()
+  and created_by = (select auth.uid())
+);
+
+create policy "Admins update prompts"
+on public.prompts
+for update
+to authenticated
+using (public.is_promptix_admin())
+with check (public.is_promptix_admin());
+
+create policy "Users insert ratings"
+on public.ratings
+for insert
+to authenticated
+with check ((select auth.uid()) = user_id);
+
+create policy "Users update ratings"
+on public.ratings
+for update
+to authenticated
+using ((select auth.uid()) = user_id)
+with check ((select auth.uid()) = user_id);
+
+create or replace function public.refresh_prompt_rating()
+returns trigger
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  target_prompt uuid;
+begin
+  target_prompt := coalesce(new.prompt_id, old.prompt_id);
+
+  update public.prompts
+  set
+    average_rating = coalesce(
+      (
+        select round(avg(value)::numeric, 2)
+        from public.ratings
+        where prompt_id = target_prompt
+      ),
+      0
+    ),
+    rating_count = (
+      select count(*)
+      from public.ratings
+      where prompt_id = target_prompt
+    )
+  where id = target_prompt;
+
+  return coalesce(new, old);
+end;
+$$;
+
+drop trigger if exists ratings_refresh_prompt on public.ratings;
+
+create trigger ratings_refresh_prompt
+after insert or update or delete on public.ratings
+for each row
+execute function public.refresh_prompt_rating();
+
+create or replace function public.increment_prompt_copy(prompt_id uuid)
+returns void
+language sql
+security definer
+set search_path = ''
+as $$
+  update public.prompts
+  set copy_count = copy_count + 1
+  where id = prompt_id;
+$$;
+
+revoke all on function public.increment_prompt_copy(uuid) from public;
+grant execute on function public.increment_prompt_copy(uuid)
+to anon, authenticated;
+
+create or replace function public.set_current_popular(prompt_id uuid)
+returns void
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  if not public.is_promptix_admin() then
+    raise exception 'Admin permission required';
+  end if;
+
+  update public.prompts
+  set is_popular = false
+  where is_popular = true;
+
+  update public.prompts
+  set is_popular = true
+  where id = prompt_id;
+end;
+$$;
+
+revoke all on function public.set_current_popular(uuid) from public;
+grant execute on function public.set_current_popular(uuid)
+to anon, authenticated;
+
+insert into storage.buckets (
+  id,
+  name,
+  public,
+  file_size_limit,
+  allowed_mime_types
+)
+values (
+  'prompt-images',
+  'prompt-images',
+  true,
+  5242880,
+  array[
+    'image/jpeg',
+    'image/png',
+    'image/webp',
+    'image/gif'
+  ]
+)
+on conflict (id) do update
+set
+  public = excluded.public,
+  file_size_limit = excluded.file_size_limit,
+  allowed_mime_types = excluded.allowed_mime_types;
+
+create policy "Public reads prompt images"
+on storage.objects
+for select
+using (bucket_id = 'prompt-images');
+
+create policy "Admins upload prompt images"
+on storage.objects
+for insert
+to authenticated
+with check (
+  bucket_id = 'prompt-images'
+  and public.is_promptix_admin()
+);
+
+create policy "Admins delete prompt images"
+on storage.objects
+for delete
+to authenticated
+using (
+  bucket_id = 'prompt-images'
+  and public.is_promptix_admin()
+);
